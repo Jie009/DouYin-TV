@@ -150,6 +150,12 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private static final long CENTER_LONG_PRESS_MS = 500;
     private static final long PROGRESS_UPDATE_INTERVAL_MS = 500;
     /** If no video after this long, auto-retry (TV needs much longer than emulator). */
+    /** Intent extra that turns the pump into a no-injection control run. */
+    private static final String EXTRA_SKIP_HOOKS = "tvdy_skip_hooks";
+    /** Diagnostic override for the 精选 fallback window; negative disables it. */
+    private static final String EXTRA_JINGXUAN_FALLBACK_MS = "tvdy_jingxuan_fallback_ms";
+    /** Diagnostic: sample page state every 2s regardless of pump progress. */
+    private static final String EXTRA_PERIODIC_PROBE = "tvdy_periodic_probe";
     private static final long STARTUP_TIMEOUT_PHONE_MS = 45_000;
     private static final long STARTUP_TIMEOUT_TV_MS = 120_000;
     private static final int MAX_STARTUP_RETRIES = 3;
@@ -392,6 +398,21 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         // Start the feed pump before ExoPlayer setup so douyin.com begins
         // loading while the player stack is still being constructed (matters
         // on CPU-starved TV boxes where both compete for the same cores).
+        // Diagnostic A/B for the pump-slowness investigation: `am start --ez
+        // tvdy_skip_hooks true` runs the pump page with no injected JavaScript
+        // at all, so its boot can be compared against the normal run. Note the
+        // `--ez`: plain `-e` passes a String and getBooleanExtra then parses
+        // only "true", so `-e tvdy_skip_hooks 1` silently reads as false.
+        FeedPumpController.skipHookInjection =
+                getIntent().getBooleanExtra(EXTRA_SKIP_HOOKS, false);
+        FeedPumpController.jingxuanFallbackMsOverride =
+                getIntent().getIntExtra(EXTRA_JINGXUAN_FALLBACK_MS, 0);
+        FeedPumpController.periodicProbe =
+                getIntent().getBooleanExtra(EXTRA_PERIODIC_PROBE, false);
+        if (FeedPumpController.skipHookInjection) {
+            StartupTrace.mark("DIAG: hook injection DISABLED");
+        }
+
         pump = new FeedPumpController(this);
         pump.setListener(new FeedPumpController.Listener() {
             @Override

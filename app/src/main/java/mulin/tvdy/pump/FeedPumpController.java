@@ -128,6 +128,23 @@ public final class FeedPumpController implements PageRequester {
     // avoiding but does recover.
     private static final long JINGXUAN_FALLBACK_MS = 5_000;
 
+    /**
+     * First check for the 精选 guard. The check re-arms while the document is
+     * still loading, so this is when the guard starts looking, not when it
+     * gives up - see {@link #scheduleJingxuanFallback()}.
+     */
+    private static final long JINGXUAN_FALLBACK_RECHECK_MS = 2_000;
+
+    /** Ceiling on the re-arming 精选 guard: past this, reload home regardless. */
+    private static final long JINGXUAN_FALLBACK_HARD_CAP_MS = 30_000;
+
+    /**
+     * Silence required after the document finishes loading before the 精选
+     * guard may conclude the page will never call. Reloading the moment
+     * {@code onPageFinished} lands would abort pages that call just after it.
+     */
+    private static final long JINGXUAN_FALLBACK_GRACE_MS = 5_000;
+
     private static final long PAGE_FETCH_TIMEOUT_MS = 20_000;
 
     private static final long PAGE_FETCH_TIMEOUT_ACTIVE_MS = 45_000;
@@ -142,6 +159,13 @@ public final class FeedPumpController implements PageRequester {
     // JSON one before nudging again. While this is pending, nudgePageForFeed()
     // refuses to act, so this value is a hard floor on how long a cold start
     // can sit doing nothing if that follow-up never comes.
+    //
+    // Tried cutting this to 2.5s on the theory that the window was dead time.
+    // Measured on the TV: the nudge did move earlier (lite binary +24.0s, nudge
+    // +25.3s instead of +32.0s) but the feed still arrived at +33.8s against a
+    // +33.4s baseline. The nudge was not the gate - the page needs ~7s on this
+    // CPU to answer the pagination nudge, and that latency is not ours to
+    // tune. Left at 8s rather than changed for no measured gain.
     private static final long LITE_JSON_FALLBACK_MS = 8_000;
 
     private static final int PUMP_LOW_WATER_MARK = 5;
@@ -194,11 +218,40 @@ public final class FeedPumpController implements PageRequester {
 
     private int blockedResourceCount = 0;
 
+    /**
+     * Diagnostic A/B switch. When set, the pump injects no JavaScript into the
+     * page at all - no document-start hooks, no service-worker interception,
+     * no synthetic nudge events. The page then behaves exactly as it would in
+     * a plain WebView, which is what separates "our injection breaks douyin's
+     * SPA" from "this box cannot run douyin's SPA".
+     * <p>
+     * Set from {@code PlayerActivity} via {@code am start -e tvdy_skip_hooks 1}.
+     * Static because the pump is built during {@code onCreate}, before there is
+     * anywhere else to carry the flag.
+     */
+    public static boolean skipHookInjection = false;
+
+    /**
+     * Diagnostic override for {@link #JINGXUAN_FALLBACK_MS}: {@code 0} keeps the
+     * constant, a positive value changes the window, and a negative value
+     * disables the fallback so the first page load is never interrupted. Set
+     * from {@code PlayerActivity} via {@code -e tvdy_jingxuan_fallback_ms N}.
+     */
+    public static long jingxuanFallbackMsOverride = 0;
+
     /** Reset per document so {@link #injectHooks()} sends INSTALL_HOOKS once. */
 
     private boolean hooksInjectedForDocument = false;
 
     private boolean pageInteractive = false;
+
+    /**
+     * When the current document reached {@code onPageFinished}, or 0 while it is
+     * still loading. {@link #pageInteractive} is not this signal: it flips at
+     * 50% progress, which a TV box reports while the document is still empty.
+     * The 精选 guard needs the real one - see {@link #scheduleJingxuanFallback()}.
+     */
+    private long documentLoadedAtMs = 0;
 
     private final FeedPaginationState paginationState = new FeedPaginationState();
 
@@ -381,6 +434,12 @@ public final class FeedPumpController implements PageRequester {
 
         createWebView();
 
+        if (periodicProbe) {
+
+            handler.post(periodicProbeRunnable);
+
+        }
+
     }
 
 
@@ -468,6 +527,8 @@ public final class FeedPumpController implements PageRequester {
 
 
     private void nudgePageForFeed(boolean forceInitial) {
+
+        if (skipHookInjection) return;
 
         if (webView == null || pageFetchInFlight || creatorMode) return;
 
@@ -686,6 +747,8 @@ public final class FeedPumpController implements PageRequester {
         apiCallsSeen = 0;
 
         pageInteractive = false;
+
+        documentLoadedAtMs = 0;
 
         paginationState.reset();
 
@@ -907,6 +970,8 @@ public final class FeedPumpController implements PageRequester {
 
                 pageInteractive = false;
 
+                documentLoadedAtMs = 0;
+
                 // New document: its window (and therefore its hook flags) reset.
                 hooksInjectedForDocument = false;
 
@@ -927,6 +992,8 @@ public final class FeedPumpController implements PageRequester {
                 super.onPageFinished(view, url);
 
                 StartupTrace.mark("pump onPageFinished");
+
+                documentLoadedAtMs = SystemClock.uptimeMillis();
 
                 injectHooks();
 
@@ -1378,6 +1445,8 @@ public final class FeedPumpController implements PageRequester {
 
     private void installDocumentStartHooks() {
 
+        if (skipHookInjection) return;
+
         try {
 
             if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
@@ -1446,6 +1515,13 @@ public final class FeedPumpController implements PageRequester {
      * Guards the 精选 fast path: if the page never gets as far as issuing any
      * API call, reload home, which redirects itself back to 精选 once its SPA
      * is up. Skipped when a feed is already arriving, and fires at most once.
+     * <p>
+     * The check re-arms while the first document is still in flight instead of
+     * firing on a bare wall clock. A fixed 5s window is meaningless on a TV box,
+     * where the SPA is not interactive until 10-18s: it aborted the very load
+     * that was about to succeed, and the reload never recovered inside the
+     * startup timeout. Waiting for {@link #pageInteractive} means the reload
+     * only happens once the page has settled and still said nothing.
      */
     private void scheduleJingxuanFallback() {
 
@@ -1453,26 +1529,64 @@ public final class FeedPumpController implements PageRequester {
 
         if (jingxuanFallbackUsed) return;
 
-        jingxuanFallback = () -> {
+        final long delayMs = jingxuanFallbackMsOverride != 0
+                ? jingxuanFallbackMsOverride
+                : JINGXUAN_FALLBACK_MS;
+        if (delayMs < 0) {
+            Log.d(TAG, "jingxuan fallback disabled by diagnostic override");
+            return;
+        }
 
-            if (webView == null || creatorMode) return;
+        final long armedAtMs = SystemClock.uptimeMillis();
+        final long deadlineMs = armedAtMs + JINGXUAN_FALLBACK_HARD_CAP_MS;
 
-            if (apiCallsSeen > 0 || repository.bufferSize() > 0) return;
+        jingxuanFallback = new Runnable() {
+            @Override
+            public void run() {
 
-            jingxuanFallbackUsed = true;
+                if (webView == null || creatorMode) return;
 
-            Log.w(TAG, "精选 issued no API call in " + JINGXUAN_FALLBACK_MS
-                    + "ms, reloading home as fallback");
+                if (apiCallsSeen > 0 || repository.bufferSize() > 0) return;
 
-            StartupTrace.mark("pump fallback -> home");
+                // Nothing can be concluded while the document is still loading,
+                // and a page that just finished deserves the grace period before
+                // being written off.
+                if (SystemClock.uptimeMillis() < deadlineMs) {
 
-            notifyStatus("正在重新加载…");
+                    boolean stillLoading = documentLoadedAtMs == 0;
 
-            webView.loadUrl(DouyinConstants.FEED_URL);
+                    boolean withinGrace = !stillLoading
+                            && SystemClock.uptimeMillis() - documentLoadedAtMs
+                                    < JINGXUAN_FALLBACK_GRACE_MS;
 
+                    if (stillLoading || withinGrace) {
+
+                        Log.d(TAG, "精选 still loading, deferring fallback check");
+
+                        handler.postDelayed(this, JINGXUAN_FALLBACK_RECHECK_MS);
+
+                        return;
+
+                    }
+
+                }
+
+                jingxuanFallbackUsed = true;
+
+                Log.w(TAG, "精选 issued no API call after "
+                        + (SystemClock.uptimeMillis() - armedAtMs)
+                        + "ms, reloading home as fallback");
+
+                StartupTrace.mark("pump fallback -> home");
+
+                notifyStatus("正在重新加载…");
+
+                webView.loadUrl(DouyinConstants.FEED_URL);
+
+            }
         };
 
-        handler.postDelayed(jingxuanFallback, JINGXUAN_FALLBACK_MS);
+        handler.postDelayed(jingxuanFallback, delayMs);
 
     }
 
@@ -1557,6 +1671,22 @@ public final class FeedPumpController implements PageRequester {
 
 
 
+    /**
+     * Diagnostic only: samples page state every 2s so a verification/block page
+     * that only appears long after the probes stop can still be observed.
+     * Enabled with {@code -e tvdy_periodic_probe true}.
+     */
+    public static boolean periodicProbe = false;
+
+    private final Runnable periodicProbeRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!periodicProbe || webView == null) return;
+            probePageState();
+            handler.postDelayed(this, 2_000);
+        }
+    };
+
     private void probePageState() {
 
         if (webView != null) {
@@ -1580,6 +1710,8 @@ public final class FeedPumpController implements PageRequester {
 
 
     private void setupServiceWorkerInterception() {
+
+        if (skipHookInjection) return;
 
         try {
 
@@ -1624,6 +1756,8 @@ public final class FeedPumpController implements PageRequester {
 
 
     private void injectHooks() {
+
+        if (skipHookInjection) return;
 
         if (webView == null) return;
 
@@ -1878,6 +2012,8 @@ public final class FeedPumpController implements PageRequester {
                     + " captchaHint=" + obj.optBoolean("captchaHint", false)
 
                     + " bodyLen=" + obj.optInt("bodyLen", -1)
+
+                    + " snip=\"" + obj.optString("snip", "") + "\""
 
                     + " err=" + obj.optString("error", ""));
 

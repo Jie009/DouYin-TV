@@ -248,6 +248,11 @@ final class FeedHookScripts {
                     + "window.AndroidBridge.onLiteFeedBinary(u);"
                     + "return;"
                     + "}"
+                    // Diagnostic: a feed response that carries no aweme_list is the
+                    // capture gap - log its shape so the real key can be found.
+                    + "if(isFeedReportUrl(u)){"
+                    + "console.log('tvdy-pump feed body without aweme_list len='+body.length+' head='+body.slice(0,260));"
+                    + "}"
                     + "}catch(e){}"
                     + "}"
                     + "function reportParsedFeed(obj){"
@@ -390,7 +395,11 @@ final class FeedHookScripts {
                     + "hooked:!!window.__tvdyPumpHooked,"
                     + "videos:document.querySelectorAll('video').length,"
                     + "loginHint:body.indexOf('\\u767b\\u5f55')>=0||body.indexOf('\\u626b\\u7801')>=0,"
-                    + "captchaHint:body.indexOf('\\u9a8c\\u8bc1')>=0"
+                    + "captchaHint:body.indexOf('\\u9a8c\\u8bc1')>=0,"
+                    // Diagnostic: the raw text, so a verification/block page can
+                    // be told apart from a healthy page that happens to contain
+                    // the word. Whitespace-collapsed to keep it one log line.
+                    + "snip:String(body||'').replace(/\\s+/g,' ').slice(0,300)"
                     + "};"
                     + "if(window.AndroidBridge){window.AndroidBridge.onPageProbe(JSON.stringify(info));}"
                     + "}catch(e){"
