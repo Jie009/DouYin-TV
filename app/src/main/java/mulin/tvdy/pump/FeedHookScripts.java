@@ -21,6 +21,14 @@ final class FeedHookScripts {
      */
     static final String STORAGE_POLYFILL =
             "(function(){"
+                    // INSTALL_HOOKS gets re-evaluated on every onPageStarted /
+                    // onPageFinished / 2s hook tick / kickstart attempt. Its
+                    // own version guard sits *after* this block, so without
+                    // this each injection spawned another setInterval poller
+                    // (100ms x 25) on top of the previous ones. window is
+                    // per-document, so a real navigation still re-runs it.
+                    + "if(window.__tvdyStoragePolyfillStarted)return;"
+                    + "window.__tvdyStoragePolyfillStarted=true;"
                     + "function tvdyMakeStore(){"
                     + "var m=Object.create(null);"
                     + "return {"
@@ -375,7 +383,10 @@ final class FeedHookScripts {
                     + "var body=(document.body&&document.body.innerText)||'';"
                     + "var info={"
                     + "w:window.innerWidth,h:window.innerHeight,"
+                    + "bodyLen:body.length,"
                     + "title:document.title||'',"
+                    + "href:(location.href||'').slice(0,120),"
+                    + "ready:(document.readyState||''),"
                     + "hooked:!!window.__tvdyPumpHooked,"
                     + "videos:document.querySelectorAll('video').length,"
                     + "loginHint:body.indexOf('\\u767b\\u5f55')>=0||body.indexOf('\\u626b\\u7801')>=0,"
@@ -470,7 +481,11 @@ final class FeedHookScripts {
                     + "fire('keydown');"
                     + "setTimeout(function(){fire('keyup');},30);"
                     + "setTimeout(function(){"
-                    + "var amount=Math.max(window.innerHeight||720,document.documentElement.clientHeight||720,720);"
+                    // documentElement can be transiently null mid-navigation; the
+                    // unguarded read used to throw here and abort the callback
+                    // *before* scrollBy, so the nudge silently did nothing.
+                    + "var de=document.documentElement;"
+                    + "var amount=Math.max(window.innerHeight||720,(de&&de.clientHeight)||720,720);"
                     + "try{window.scrollBy({top:amount,behavior:'auto'});}catch(err){window.scrollBy(0,amount);}"
                     + "},150);"
                     + "console.log('tvdy-pump initial feed nudge');"
@@ -504,7 +519,11 @@ final class FeedHookScripts {
                     + "||document.querySelector('button[aria-label*=\"\\u4e0b\\u4e00\\u6761\"]');"
                     + "if(nextBtn){try{nextBtn.click();}catch(err){}}"
                     + "fire('keydown');fire('keyup');"
-                    + "var amount=Math.max(window.innerHeight||720,document.documentElement.clientHeight||720,720);"
+                    // documentElement can be transiently null mid-navigation; the
+                    // unguarded read used to throw here and abort the callback
+                    // *before* scrollBy, so the nudge silently did nothing.
+                    + "var de=document.documentElement;"
+                    + "var amount=Math.max(window.innerHeight||720,(de&&de.clientHeight)||720,720);"
                     + "try{window.scrollBy({top:amount,behavior:'auto'});}catch(err){window.scrollBy(0,amount);}"
                     + "try{window.scrollTo(0,document.body.scrollHeight||amount);}catch(err){}"
                     + "setTimeout(function(){fire('keydown');fire('keyup');},200);"

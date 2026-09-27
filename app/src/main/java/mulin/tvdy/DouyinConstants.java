@@ -27,9 +27,16 @@ public final class DouyinConstants {
     public static final String JINGXUAN_FEED_URL = "https://www.douyin.com/jingxuan";
     public static final String REFERER = "https://www.douyin.com/";
 
-    /** Anonymous cold start uses home; logged-in uses 精选 for faster feed APIs. */
+    /**
+     * Measured on the emulator, the anonymous home page is not a shortcut at
+     * all: it reaches interactive, then douyin navigates itself to /jingxuan
+     * and boots the whole SPA a second time. Going to 精选 directly skips that
+     * second boot (~1-1.5s). It is occasionally unreliable for anonymous
+     * sessions though, so FeedPumpController reloads home as a fallback when
+     * nothing has arrived - see {@code scheduleJingxuanFallback}.
+     */
     public static String pumpStartUrl(boolean loggedIn) {
-        return loggedIn ? JINGXUAN_FEED_URL : FEED_URL;
+        return JINGXUAN_FEED_URL;
     }
 
     public static String creatorProfileUrl(String secUid) {
@@ -61,9 +68,12 @@ public final class DouyinConstants {
         headers.put("Accept", "*/*");
         headers.put("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8");
         try {
-            CookieManager cookieManager = CookieManager.getInstance();
-            cookieManager.flush();
-            String cookie = cookieManager.getCookie(FEED_URL);
+            // No flush() here on purpose. This runs on every playback open()
+            // (including preloads), and flush() is a blocking disk write;
+            // getCookie() already returns the live in-memory value, which is
+            // what the pump WebView wrote. CookieImportHelper flushes after
+            // it writes a new session.
+            String cookie = CookieManager.getInstance().getCookie(FEED_URL);
             if (cookie != null && !cookie.isEmpty()) {
                 headers.put("Cookie", cookie);
             }
@@ -72,9 +82,9 @@ public final class DouyinConstants {
         return Collections.unmodifiableMap(headers);
     }
 
+    /** Diagnostics only - called from a main-thread log statement, so no flush(). */
     public static int playbackCookieLength() {
         try {
-            CookieManager.getInstance().flush();
             String cookie = CookieManager.getInstance().getCookie(FEED_URL);
             return cookie != null ? cookie.length() : 0;
         } catch (Exception e) {

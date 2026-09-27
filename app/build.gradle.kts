@@ -46,8 +46,8 @@ dependencies {
     // 3.4.1 predates zxing's newer releases' Android API 24+ requirement,
     // so it stays compatible with this project's minSdk 21.
     implementation("com.google.zxing:core:3.4.1")
-    // Renders the startup loading.json animation (see PlayerActivity's
-    // splash overlay); 6.7.1 still supports minSdk 21.
+    // Renders the startup spinner (see PlayerActivity's splash overlay);
+    // 6.7.1 still supports minSdk 21.
     implementation("com.airbnb.android:lottie:6.7.1")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
 

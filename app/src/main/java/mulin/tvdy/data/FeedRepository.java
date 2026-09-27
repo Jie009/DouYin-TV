@@ -5,6 +5,8 @@ import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import mulin.tvdy.StartupTrace;
+
 import java.util.ArrayDeque;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
@@ -121,6 +123,10 @@ public final class FeedRepository {
         Log.d(TAG, "addAwemeList: +" + added + " noUrl=" + skippedNoUrl
                 + " dup=" + skippedDup + " watched=" + skippedWatched
                 + " bufferSize=" + queue.size());
+
+        if (added > 0 && queue.size() == added) {
+            StartupTrace.mark("repository: first items queued (" + added + ")");
+        }
 
         if (added == 0 && awemeList.length() > 0 && skippedWatched > 0) {
             consecutiveAllFilteredBatches++;
