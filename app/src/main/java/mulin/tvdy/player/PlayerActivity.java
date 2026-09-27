@@ -6,6 +6,9 @@ import android.content.pm.ActivityInfo;
 import android.graphics.Color;
 import android.graphics.Bitmap;
 import android.graphics.Outline;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -28,18 +31,22 @@ import android.widget.Toast;
 import com.airbnb.lottie.LottieAnimationView;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.annotation.OptIn;
 import androidx.media3.common.AudioAttributes;
 import androidx.media3.common.C;
+import androidx.media3.common.Format;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
+import androidx.media3.exoplayer.DecoderReuseEvaluation;
 import androidx.media3.exoplayer.DefaultLoadControl;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.ExoPlayer.PreloadConfiguration;
 import androidx.media3.exoplayer.RenderersFactory;
+import androidx.media3.exoplayer.analytics.AnalyticsListener;
 import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider;
@@ -61,6 +68,7 @@ import java.util.regex.Pattern;
 import mulin.tvdy.DeviceUtils;
 import mulin.tvdy.DouyinConstants;
 import mulin.tvdy.R;
+import mulin.tvdy.StartupTrace;
 import mulin.tvdy.auth.CookieHandoffServer;
 import mulin.tvdy.auth.CookieImportHelper;
 import mulin.tvdy.auth.LoginStatusChecker;
@@ -103,6 +111,9 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     }
 
     private static final String TAG = "PlayerActivity";
+
+    /** Separate tag so a codec trace can be grepped without the rest of logcat. */
+    private static final String CODEC_TAG = "PlayerCodec";
     /** Upcoming items to buffer; kept small so preload does not starve the active stream. */
     private static final int PRELOAD_AHEAD = 2;
     /** Buffer target for the next playlist item while playing (µs). */
@@ -311,6 +322,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     @OptIn(markerClass = UnstableApi.class)
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        StartupTrace.mark("PlayerActivity.onCreate enter");
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         enableImmersiveMode();
@@ -488,6 +500,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
             @Override
             public void onRenderedFirstFrame() {
+                StartupTrace.mark("player: FIRST FRAME rendered");
                 if (slideAnimating) {
                     pendingCoverDismiss = true;
                     return;
@@ -507,11 +520,82 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 playNext();
             }
         });
+
+        // Codec-level tracing for the "some videos render solid green after
+        // the app has been open a while" report. A green frame is what a
+        // decoder writes when its output surface or its chroma planes are not
+        // usable, so the question that settles it is *which* decoder produced
+        // it: the same hardware decoder that renders every healthy video (a
+        // surface/reuse problem), a hardware HEVC decoder (a bad HEVC stream or
+        // a broken box decoder), or a software decoder Media3 fell back to
+        // because hardware codec instances were exhausted (a resource
+        // problem). Those need three different fixes and the player logs none
+        // of it by default.
+        player.addAnalyticsListener(new AnalyticsListener() {
+            @Override
+            public void onVideoInputFormatChanged(EventTime eventTime, Format format,
+                                                  @Nullable DecoderReuseEvaluation reuse) {
+                Log.i(CODEC_TAG, "input format mime=" + format.sampleMimeType
+                        + " " + format.width + "x" + format.height
+                        + " bitrate=" + format.bitrate
+                        + " reuseResult=" + (reuse != null ? reuse.result : -1)
+                        + " awemeId=" + (current != null ? current.awemeId : "?"));
+            }
+
+            @Override
+            public void onVideoDecoderInitialized(EventTime eventTime, String decoderName,
+                                                  long initializedTimestampMs,
+                                                  long initializationDurationMs) {
+                Log.i(CODEC_TAG, "decoder=" + decoderName
+                        + " kind=" + decoderKind(decoderName)
+                        + " initMs=" + initializationDurationMs
+                        + " awemeId=" + (current != null ? current.awemeId : "?"));
+            }
+
+            @Override
+            public void onVideoDecoderReleased(EventTime eventTime, String decoderName) {
+                Log.i(CODEC_TAG, "decoder released=" + decoderName);
+            }
+
+            @Override
+            public void onDroppedVideoFrames(EventTime eventTime, int droppedFrames,
+                                             long elapsedMs) {
+                Log.w(CODEC_TAG, "dropped frames=" + droppedFrames + " in " + elapsedMs + "ms");
+            }
+        });
+
         playerView.setPlayer(player);
 
         repository.addListener(this);
         creatorRepository.addListener(this::onCreatorVideosChanged);
         startInitialPlayback();
+        StartupTrace.mark("PlayerActivity.onCreate exit");
+    }
+
+    /**
+     * Classifies a MediaCodec name as hardware or software. Media3 picks from
+     * {@link android.media.MediaCodecList} in order, so a fallback after a
+     * hardware decoder fails shows up here as a sudden switch to a
+     * {@code *.sw.*} / {@code c2.android.*} / {@code OMX.google.*} name.
+     */
+    private static String decoderKind(String decoderName) {
+        if (decoderName == null) return "unknown";
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                for (MediaCodecInfo info : new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos()) {
+                    if (decoderName.equals(info.getName())) {
+                        return info.isHardwareAccelerated() ? "hardware" : "software";
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        String lower = decoderName.toLowerCase(Locale.US);
+        if (lower.startsWith("c2.android.") || lower.startsWith("omx.google.")
+                || lower.contains(".sw.")) {
+            return "software";
+        }
+        return "hardware?";
     }
 
     /** Keeps the live player on page A; page B is cover-only staging off-screen. */
@@ -591,6 +675,10 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         if (!splashVisible) return;
         splashVisible = false;
         cancelStartupTimeout();
+        // Note in the timeline: this is where the third WebView (login check)
+        // and the watch-history sync land, i.e. right on top of the first
+        // video's initial buffering.
+        StartupTrace.mark("startup login check + history sync kick off");
         maybeRunDeferredLoginCheck();
         splashOverlay.animate()
                 .alpha(0f)
@@ -618,6 +706,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 + " cookieLen=" + DouyinConstants.playbackCookieLength()
                 + " candidates=" + current.playUrlCandidates.size()
                 + " url=" + playbackUrlFor(current));
+        StartupTrace.mark("player: prepare() first item");
         player.prepare();
         player.setPlayWhenReady(true);
         player.play();
@@ -1497,11 +1586,26 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         if (video == null) return "";
         FeedVideo.SplitPlayUrl split = selectedSplit(video);
         if (split != null) return split.videoUrl;
-        int idx = playUrlCandidateIndex.getOrDefault(video.awemeId, 0);
-        if (idx >= 0 && idx < video.playUrlCandidates.size()) {
-            return video.playUrlCandidates.get(idx);
+        int idx = Math.max(playUrlCandidateIndex.getOrDefault(video.awemeId, 0), 0);
+        boolean hevcOk = HevcCapability.isSupported();
+        // selectedSplit() refuses HEVC when the probe says no HEVC, but this
+        // list is plain URLs with the flag already thrown away, so the gate was
+        // silently missing here: collectPlayUrls() keeps HEVC entries (sorted
+        // last, not dropped) and this returned whichever sat at the index.
+        for (int i = idx; i < video.playUrlCandidates.size(); i++) {
+            String candidate = video.playUrlCandidates.get(i);
+            if (!hevcOk && looksHevc(candidate)) continue;
+            if (i != idx) playUrlCandidateIndex.put(video.awemeId, i);
+            return candidate;
         }
         return video.playUrl != null ? video.playUrl : "";
+    }
+
+    /** Same URL-level sniff {@link FeedVideo} uses when building its candidates. */
+    private static boolean looksHevc(String url) {
+        if (url == null) return false;
+        String lower = url.toLowerCase(Locale.US);
+        return lower.contains("hvc1") || lower.contains("bytevc1") || lower.contains("hevc");
     }
 
     private static String playbackModeLabel(FeedVideo video) {
@@ -1536,6 +1640,13 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         }
 
         int nextIdx = playUrlCandidateIndex.getOrDefault(current.awemeId, 0) + 1;
+        // Same missing HEVC gate as playbackUrlFor() - step over HEVC mirrors
+        // when the device said it cannot decode them.
+        boolean hevcOk = HevcCapability.isSupported();
+        while (nextIdx < current.playUrlCandidates.size()
+                && !hevcOk && looksHevc(current.playUrlCandidates.get(nextIdx))) {
+            nextIdx++;
+        }
         if (nextIdx >= current.playUrlCandidates.size()) return false;
         playUrlCandidateIndex.put(current.awemeId, nextIdx);
         String altUrl = current.playUrlCandidates.get(nextIdx);
