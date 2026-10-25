@@ -785,15 +785,30 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             // shorten. The videos arrive already distilled, so this is a few
             // tens of milliseconds - see FeedSnapshotStore.
             repository.addVideosBlocking(videos);
-            snapshotSourcedItems = Math.max(0, repository.bufferSize() - before);
+            int accepted = Math.max(0, repository.bufferSize() - before);
+            snapshotSourcedItems = accepted;
             StartupTrace.mark("startup: repository primed from snapshot n=" + videos.size()
-                    + " accepted=" + snapshotSourcedItems
+                    + " accepted=" + accepted
                     + " buffer=" + repository.bufferSize());
-            // Everything in the snapshot was already watched on this account, so
-            // there is nothing to show for the fast path. Forget the snapshot so
-            // the pump's fresh capture is not treated as duplicate, and let the
-            // normal splash-and-wait flow take over.
-            if (snapshotSourcedItems == 0) {
+            if (before > 0) {
+                // Warm restart: the process outlived the last Activity, so the
+                // repository singleton still holds playable videos. The snapshot
+                // adding nothing here means its items are duplicates of what is
+                // already queued, not that the fast path failed - so the queue
+                // must be kept. These items are of the same vintage as the
+                // snapshot (the last session's capture), so they carry the same
+                // stale-link risk: mark them snapshot-sourced so a dead link
+                // still degrades to the pump instead of flicking through the
+                // rest of the queue as black frames.
+                snapshotSourcedItems = repository.bufferSize();
+                StartupTrace.mark("startup: reusing warm buffer n=" + before);
+                return;
+            }
+            // Cold start with everything in the snapshot already watched on this
+            // account, so there is nothing to show for the fast path. Forget the
+            // snapshot so the pump's fresh capture is not treated as duplicate,
+            // and let the normal splash-and-wait flow take over.
+            if (accepted == 0) {
                 StartupTrace.mark("startup: snapshot fully filtered, using pump");
                 repository.reset();
             }
