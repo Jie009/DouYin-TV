@@ -2230,6 +2230,10 @@ public final class FeedPumpController implements PageRequester {
                     + " apiCallsSeen=" + apiCallsSeen
                     + " blockedSubresources=" + blockedResourceCount);
 
+            // The snapshot for the next cold start is persisted by
+            // FeedRepository from the accepted videos, so the disk form is
+            // written from data already parsed rather than re-parsing the raw
+            // body - see FeedRepository#persistSnapshotForColdStart.
             repository.addAwemeList(list);
 
         } catch (Exception e) {

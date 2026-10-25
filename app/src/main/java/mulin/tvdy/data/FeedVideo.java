@@ -3,6 +3,7 @@ package mulin.tvdy.data;
 import android.util.Log;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
@@ -22,7 +23,7 @@ import java.util.Locale;
 public final class FeedVideo {
 
     private static final String TAG = "TvdyFeedDump";
-    private static final int MAX_DIAGNOSTIC_DUMPS = 8;
+    private static final int MAX_DIAGNOSTIC_DUMPS = 0;
     private static int diagnosticDumpsRemaining = MAX_DIAGNOSTIC_DUMPS;
 
     public final String awemeId;
@@ -175,6 +176,144 @@ public final class FeedVideo {
     /** True when this item has at least one video+audio split pair. */
     public boolean hasSplitStream() {
         return splitCandidates != null && !splitCandidates.isEmpty();
+    }
+
+    // --- Snapshot (de)serialization -----------------------------------------
+    //
+    // A cold start used to re-parse the raw aweme items the pump captured:
+    // 2.8MB of JSON that org.json walks in ~2.5s, then ~1.8s more in
+    // fromAwemeItem's full-tree URL scans (both measured on the TV). Almost all
+    // of those bytes are fields nothing here reads. This pair writes only the
+    // distilled fields above, so a later launch rebuilds each FeedVideo by
+    // filling in a constructor instead of re-deriving it from the raw payload -
+    // no collectPlayUrls, no collectSplitPlayUrls, no tree walk.
+    //
+    // Field names are short because they dominate the file: a signed CDN URL is
+    // 200-400 chars and there can be a dozen per video. See SNAPSHOT_MAX_* for
+    // why the candidate lists are trimmed rather than stored whole.
+
+    /**
+     * Candidates kept per video in a snapshot. Playback retries these in order
+     * when one returns 403, and every candidate for an item shares the same
+     * signature issue, so a handful of fallbacks is as good as the full list -
+     * while the full list is most of the file. The pump reloads fresh data
+     * shortly after any cold start anyway, so this only has to survive the gap.
+     */
+    private static final int SNAPSHOT_MAX_MUXED = 4;
+    private static final int SNAPSHOT_MAX_SPLITS = 4;
+
+    /**
+     * Distilled form of this video, for {@code FeedSnapshotStore}.
+     *
+     * @throws JSONException only if a field name is null; the values written
+     *         here cannot fail to serialise.
+     */
+    public JSONObject toSnapshotJson() throws JSONException {
+        JSONObject o = new JSONObject();
+        putIfNotEmpty(o, "i", awemeId);
+        putIfNotEmpty(o, "p", playUrl);
+        putIfNotEmpty(o, "c", coverUrl);
+        putIfNotEmpty(o, "d", desc);
+        putIfNotEmpty(o, "an", authorName);
+        putIfNotEmpty(o, "au", authorAvatarUrl);
+        putIfNotEmpty(o, "as", authorSecUid);
+        putIfNotEmpty(o, "ai", authorUniqueId);
+        if (diggCount != 0) o.put("dg", diggCount);
+        if (commentCount != 0) o.put("cm", commentCount);
+        if (collectCount != 0) o.put("cl", collectCount);
+        if (shareCount != 0) o.put("sh", shareCount);
+        if (userDigged) o.put("ud", true);
+
+        if (playUrlCandidates != null && !playUrlCandidates.isEmpty()) {
+            JSONArray muxed = new JSONArray();
+            for (int i = 0; i < playUrlCandidates.size() && i < SNAPSHOT_MAX_MUXED; i++) {
+                muxed.put(playUrlCandidates.get(i));
+            }
+            o.put("pm", muxed);
+        }
+
+        if (splitCandidates != null && !splitCandidates.isEmpty()) {
+            JSONArray splits = new JSONArray();
+            for (int i = 0; i < splitCandidates.size() && i < SNAPSHOT_MAX_SPLITS; i++) {
+                SplitPlayUrl s = splitCandidates.get(i);
+                JSONObject e = new JSONObject();
+                putIfNotEmpty(e, "v", s.videoUrl);
+                putIfNotEmpty(e, "a", s.audioUrl);
+                if (s.videoBrKbps > 0) e.put("br", s.videoBrKbps);
+                if (s.hevc) e.put("h", true);
+                splits.put(e);
+            }
+            o.put("sp", splits);
+        }
+        return o;
+    }
+
+    /**
+     * Rebuilds a video written by {@link #toSnapshotJson}.
+     *
+     * @return the video, or {@code null} when the entry has no id or nothing
+     *         playable - the same bar {@link #fromAwemeItem} applies, so a
+     *         snapshot that lost its URLs to expiry is dropped here rather than
+     *         handed to the player empty.
+     */
+    public static FeedVideo fromSnapshotJson(JSONObject o) {
+        if (o == null) return null;
+        String awemeId = o.optString("i", "");
+        if (awemeId.isEmpty()) return null;
+
+        List<String> muxed = new ArrayList<>();
+        JSONArray muxedArr = o.optJSONArray("pm");
+        if (muxedArr != null) {
+            for (int i = 0; i < muxedArr.length(); i++) {
+                String url = muxedArr.optString(i, "");
+                if (!url.isEmpty()) muxed.add(url);
+            }
+        }
+
+        List<SplitPlayUrl> splits = new ArrayList<>();
+        JSONArray splitArr = o.optJSONArray("sp");
+        if (splitArr != null) {
+            for (int i = 0; i < splitArr.length(); i++) {
+                JSONObject e = splitArr.optJSONObject(i);
+                if (e == null) continue;
+                String v = e.optString("v", "");
+                String a = e.optString("a", "");
+                if (v.isEmpty() || a.isEmpty()) continue;
+                splits.add(new SplitPlayUrl(v, a, e.optInt("br", 0), e.optBoolean("h", false)));
+            }
+        }
+
+        String playUrl = o.optString("p", "");
+        if (playUrl.isEmpty()) {
+            if (!muxed.isEmpty()) playUrl = muxed.get(0);
+            else if (!splits.isEmpty()) playUrl = splits.get(0).videoUrl;
+        }
+        if (playUrl.isEmpty()) return null;
+
+        return new FeedVideo(awemeId, o.optString("d", ""), o.optString("c", null),
+                playUrl, muxed, splits,
+                o.optString("an", ""), o.optString("au", null),
+                o.optString("as", ""), o.optString("ai", ""),
+                o.optLong("dg", 0), o.optLong("cm", 0),
+                o.optLong("cl", 0), o.optLong("sh", 0),
+                o.optBoolean("ud", false));
+    }
+
+    private static void putIfNotEmpty(JSONObject o, String key, String value)
+            throws JSONException {
+        if (value != null && !value.isEmpty()) o.put(key, value);
+    }
+
+    /** Builds a video directly, for snapshot round-trip tests only. */
+    static FeedVideo forSnapshotTest(String awemeId, String desc, String coverUrl, String playUrl,
+                                     List<String> playUrlCandidates, List<SplitPlayUrl> splitCandidates,
+                                     String authorName, String authorAvatarUrl,
+                                     String authorSecUid, String authorUniqueId,
+                                     long diggCount, long commentCount, long collectCount,
+                                     long shareCount, boolean userDigged) {
+        return new FeedVideo(awemeId, desc, coverUrl, playUrl, playUrlCandidates, splitCandidates,
+                authorName, authorAvatarUrl, authorSecUid, authorUniqueId,
+                diggCount, commentCount, collectCount, shareCount, userDigged);
     }
 
     /**
