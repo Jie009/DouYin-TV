@@ -504,7 +504,7 @@
          PlayerActivity#onRenderedFirstFrame/hideSplashIfNeeded) - the feed
          fetch plus that first video's own buffering both take a moment, and
          this is friendlier than staring at a blank black screen for however
-         long that takes. Plays loading.json on loop and fades out only once
+         long that takes. Plays the spinner on loop and fades out only once
          there's real content underneath ready to reveal, rather than on a
          fixed timer that could still be showing over blank content or
          disappear too early. -->
@@ -523,13 +523,19 @@
             android:gravity="center_horizontal"
             android:orientation="vertical">
 
+            <!-- Deliberately @raw/loading_spinner (11 KB), not @raw/loading
+                 (526 KB / 900 frames / 6445 keyframes). Lottie rasterizes
+                 vector frames on the CPU, not the GPU, and this view plays
+                 for the entire cold-start wait - the same window in which
+                 the pump WebView boots douyin.com and ExoPlayer decodes the
+                 first video. The heavy animation was competing with both. -->
             <com.airbnb.lottie.LottieAnimationView
                 android:id="@+id/splashAnimation"
-                android:layout_width="180dp"
-                android:layout_height="180dp"
+                android:layout_width="96dp"
+                android:layout_height="96dp"
                 app:lottie_autoPlay="true"
                 app:lottie_loop="true"
-                app:lottie_rawRes="@raw/loading" />
+                app:lottie_rawRes="@raw/loading_spinner" />
 
             <TextView
                 android:id="@+id/splashStatusText"

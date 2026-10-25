@@ -1,23 +1,42 @@
 package mulin.tvdy.data;
 
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import mulin.tvdy.StartupTrace;
+import mulin.tvdy.TvdyApplication;
+
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * App-wide singleton buffer of playable videos, fed by the hidden data-pump
  * WebView and drained by the player UI.
  * <p>
- * Not thread-safe by design: every caller in this app (the pump's
- * JavascriptInterface callbacks and the player Activity) runs on the main
- * thread, so no internal locking is done. If a future caller needs to touch
- * this from a background thread, add synchronization then.
+ * Parsing a page of raw feed JSON is expensive: the payloads are multi-megabyte
+ * and {@code org.json} costs ~2.5s per 2.8MB before {@link FeedVideo} even runs
+ * (measured on the TV). Doing that on the main thread froze the UI for seconds
+ * at a time on every pagination batch — the "video stutters" report — so
+ * {@link #addAwemeList} keeps its shape for callers but does the parse on a
+ * worker thread and hands the finished videos back to the main thread, which is
+ * the only place {@link #queue} and its listeners are touched.
+ * <p>
+ * Because callers can no longer assume the buffer is populated by the time
+ * {@code addAwemeList} returns, the resulting state change is announced with
+ * {@link Listener#onBufferChanged(int)} (already wired to start playback) rather
+ * than being observed synchronously. Callers needing the rows immediately should
+ * use {@link #addVideosBlocking}.
  */
 public final class FeedRepository {
 
@@ -35,6 +54,18 @@ public final class FeedRepository {
     private static final long PAGE_REQUEST_COOLDOWN_MS = 2_000;
 
     private static FeedRepository instance;
+
+    /**
+     * Single worker for feed parsing. One thread, not a pool: batches must be
+     * applied in the order they arrived or the playlist order stops matching
+     * the feed's.
+     */
+    private final ExecutorService parser = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "feed-parse");
+        t.setPriority(Thread.NORM_PRIORITY - 1);
+        return t;
+    });
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     public static synchronized FeedRepository getInstance() {
         if (instance == null) {
@@ -80,17 +111,84 @@ public final class FeedRepository {
      * playable url (ads, live cards, ...) and items already seen, and
      * enqueues the rest.
      */
+    /**
+     * Parses {@code awemeList} off the main thread and enqueues the results.
+     * <p>
+     * Returns as soon as the work is queued, so the caller (the pump's main-
+     * thread response handler) never blocks on the parse. The buffer and the
+     * listener callbacks stay main-thread-only.
+     */
     public void addAwemeList(JSONArray awemeList) {
         if (awemeList == null) {
             pageRequestInFlight = false;
             maybeRequestMore();
             return;
         }
+        parser.execute(() -> {
+            ParsedBatch parsed = parseAwemeList(awemeList);
+            // A live page, so it is worth persisting for the next cold start.
+            // Handing the parse over to the snapshot store here means the disk
+            // form is written from data already in memory, with no second parse.
+            mainHandler.post(() -> commitParsed(parsed, /*persistSnapshot=*/ true));
+        });
+    }
 
-        int added = 0;
-        int skippedNoUrl = 0;
-        int skippedDup = 0;
-        int skippedWatched = 0;
+    /**
+     * Enqueues already-parsed videos on the calling thread, before returning.
+     * <p>
+     * For the startup snapshot only: there the videos come off disk already
+     * distilled, and the caller is on the main thread holding up the first
+     * frame, so hopping to a worker and back would add a round trip for
+     * nothing. Live pump batches must use {@link #addAwemeList} instead, or
+     * playback stutters.
+     * <p>
+     * The watched filter is re-applied here rather than trusted to the file:
+     * history can sync between the snapshot being written and the next launch,
+     * and an item watched since then must not be played just because it is on
+     * disk.
+     */
+    public void addVideosBlocking(List<FeedVideo> videos) {
+        if (videos == null || videos.isEmpty()) return;
+        List<FeedVideo> fresh = new ArrayList<>(videos.size());
+        boolean anyWatched = false;
+        for (FeedVideo video : videos) {
+            if (video == null) continue;
+            if (!watchedFilterBypass && watchedStore.isWatched(video.awemeId)) {
+                anyWatched = true;
+                continue;
+            }
+            fresh.add(video);
+        }
+        // Never re-persist what was just read: that would refresh the file's
+        // timestamp on every launch, and its MAX_AGE_MS would never expire.
+        commitParsed(new ParsedBatch(fresh, videos.size(), anyWatched),
+                /*persistSnapshot=*/ false);
+    }
+
+    /** A parsed page plus the counts {@link #commitParsed} needs to page onward. */
+    private static final class ParsedBatch {
+        final List<FeedVideo> videos;
+        final int rawCount;
+        final boolean anyWatched;
+
+        ParsedBatch(List<FeedVideo> videos, int rawCount, boolean anyWatched) {
+            this.videos = videos;
+            this.rawCount = rawCount;
+            this.anyWatched = anyWatched;
+        }
+    }
+
+    /**
+     * Pure, thread-safe half of {@link #addAwemeList}: turns raw items into
+     * playable videos. Touches no shared state beyond the watched store, which
+     * is itself a concurrent-safe set.
+     */
+    private ParsedBatch parseAwemeList(JSONArray awemeList) {
+        List<FeedVideo> out = new ArrayList<>(awemeList.length());
+        // Dedup within the batch on a local set: the shared seen-set is only
+        // consulted on the main thread in commitParsed().
+        HashSet<String> batchIds = new HashSet<>();
+        boolean anyWatched = false;
         for (int i = 0; i < awemeList.length(); i++) {
             JSONObject item = awemeList.optJSONObject(i);
             if (item == null) continue;
@@ -99,39 +197,49 @@ public final class FeedRepository {
             if (!watchedFilterBypass
                     && (FeedVideo.isMarkedWatchedByServer(item)
                     || watchedStore.isWatched(awemeId))) {
-                skippedWatched++;
-                if (!awemeId.isEmpty()) watchedStore.markWatched(awemeId);
+                anyWatched = true;
                 continue;
             }
 
             FeedVideo video = FeedVideo.fromAwemeItem(item);
-            if (video == null) {
-                skippedNoUrl++;
-                continue;
-            }
-            if (!seenAwemeIds.add(video.awemeId)) {
-                skippedDup++;
-                continue;
-            }
+            if (video == null) continue;
+            if (!batchIds.add(video.awemeId)) continue;
+            out.add(video);
+        }
+        return new ParsedBatch(out, awemeList.length(), anyWatched);
+    }
+
+    /** Main-thread half: applies a parsed batch to the queue and notifies. */
+    private void commitParsed(ParsedBatch batch, boolean persistSnapshot) {
+        int added = 0;
+        for (FeedVideo video : batch.videos) {
+            if (!seenAwemeIds.add(video.awemeId)) continue;
             trimSeenIdsIfNeeded();
             queue.addLast(video);
             added++;
         }
 
-        Log.d(TAG, "addAwemeList: +" + added + " noUrl=" + skippedNoUrl
-                + " dup=" + skippedDup + " watched=" + skippedWatched
+        Log.d(TAG, "commitParsed: +" + added + " raw=" + batch.rawCount
                 + " bufferSize=" + queue.size());
 
-        if (added == 0 && awemeList.length() > 0 && skippedWatched > 0) {
+        // Persist what entered the queue - not the raw page, which is mostly
+        // unread fields. See FeedSnapshotStore for why the distilled form is
+        // what a cold start wants.
+        if (persistSnapshot && added > 0) {
+            persistSnapshotForColdStart();
+        }
+
+        if (added > 0 && queue.size() == added) {
+            StartupTrace.mark("repository: first items queued (" + added + ")");
+        }
+
+        if (added == 0 && batch.rawCount > 0 && batch.anyWatched) {
             consecutiveAllFilteredBatches++;
             pageRequestInFlight = false;
             if (consecutiveAllFilteredBatches < MAX_ALL_FILTERED_BATCHES) {
-                Log.d(TAG, "batch all watched/filtered, requesting next page ("
-                        + consecutiveAllFilteredBatches + "/" + MAX_ALL_FILTERED_BATCHES + ")");
                 maybeRequestMore();
                 return;
             }
-            Log.w(TAG, "too many all-watched batches, allowing repeats so playback can start");
             watchedFilterBypass = true;
             consecutiveAllFilteredBatches = 0;
             maybeRequestMore();
@@ -247,6 +355,27 @@ public final class FeedRepository {
             Iterator<String> it = seenAwemeIds.iterator();
             it.next();
             it.remove();
+        }
+    }
+
+    /**
+     * Hands the pending playlist to {@link FeedSnapshotStore} for the next
+     * cold start.
+     * <p>
+     * Called only for batches that came off the network, and only while the
+     * app is on the for-you feed, so the file always reflects a fresh capture
+     * rather than a replay of itself. A missing application context (plain JVM
+     * tests) and a disabled/absent store are both non-events - the next launch
+     * simply falls back to the pump.
+     */
+    private void persistSnapshotForColdStart() {
+        if (pageRequester == null) return; // No pump wired up: nothing captured.
+        android.app.Application app = TvdyApplication.appContext();
+        if (app == null) return;
+        try {
+            FeedSnapshotStore.write(app, new ArrayList<>(queue));
+        } catch (Throwable t) {
+            Log.w(TAG, "snapshot persist failed", t);
         }
     }
 

@@ -9,6 +9,8 @@
 
 TV DY 采用 **原生 ExoPlayer 播放 + 隐藏 WebView 数据泵** 的混合架构：后台 WebView 加载 douyin.com 并拦截页面自带的 feed 接口响应，提取带有效签名的视频流地址；前台用 ExoPlayer 全屏播放，上下切换带 TikTok 式滑动动画，专为遥控器操作优化。
 
+为缩短冷启动，feed 快照与视频字节会落盘缓存。「启动即播」快路径见下方[冷启动](#冷启动)一节。
+
 > 本项目为第三方开源客户端，与抖音官方无任何关联。仅供学习交流，请遵守相关法律法规与平台服务条款。
 
 ---
@@ -185,6 +187,27 @@ app/src/main/java/mulin/tvdy/
 - [AndroidX WebKit](https://developer.android.com/develop/ui/views/layout/webapps) — WebView 兼容层
 - [ZXing](https://github.com/zxing/zxing) — 登录二维码生成
 - [Lottie](https://airbnb.io/lottie/) — 启动与加载动画
+
+---
+
+## 冷启动
+
+抖音网页版是一个体积极大的 SPA，页面启动脚本还被编译成字节码。实测在电视上从 `Application.onCreate` 到首帧约 33 秒，其中近 31 秒花在「等 WebView 把抖音页面跑起来、再由页面自己发出带签名的 feed 请求」——这部分不在本项目的控制范围内，无法通过改本项目的代码消除。
+
+因此启动路径改为两级：
+
+1. **快路径（命中缓存时）** — 启动时直接读取上次成功捕获的 feed JSON（`FeedSnapshotStore`，内部存储，上限 20 条 / 6 小时有效），立刻建出播放列表并起播，完全不等待 WebView。封面同样从磁盘读取（`CoverDiskCache`），视频字节走 ExoPlayer 磁盘缓存（`MediaCacheStore`，上限 200 MB），命中时不发网络请求。
+2. **回退路径** — 快照不存在、已过期，或其签名链接已失效时，自动回到原有的 WebView 数据泵流程，行为与从前一致。
+
+关于签名：抖音的 CDN 直链是短时效的（实测 6 天前的链接返回 `403 time expired`），每次抓取 feed 都会重新签发。所以媒体缓存不按完整 URL 作键，而是取 URL 中内容寻址的路径部分作键（见 `MediaCacheStore.canonicalKey`），使同一视频在不同会话中命中同一条缓存。
+
+诊断时间线：
+
+```bash
+adb logcat -c && adb logcat -s StartupTrace:I
+```
+
+命中快路径时会出现 `startup: repository primed from snapshot n=…`；链接失效回退时会出现 `startup: snapshot abandoned after player error`。
 
 ---
 

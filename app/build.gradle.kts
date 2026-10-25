@@ -14,8 +14,8 @@ android {
         applicationId = "mulin.tvdy"
         minSdk = 21
         targetSdk = 35
-        versionCode = 60
-        versionName = "1.0"
+        versionCode = 61
+        versionName = "1.0.2"
 
     }
 
@@ -41,13 +41,17 @@ dependencies {
     implementation("androidx.webkit:webkit:1.14.0")
     // 1.8.x is the last media3 line with minSdk 21; 1.9.0+ requires 23.
     implementation("androidx.media3:media3-exoplayer:1.8.1")
+    // CacheDataSource / SimpleCache for the media byte cache (see
+    // MediaCacheStore); exoplayer pulls this in transitively, but the cache
+    // API is used directly so it is declared explicitly.
+    implementation("androidx.media3:media3-datasource:1.8.1")
     implementation("androidx.media3:media3-ui:1.8.1")
     // Pure-Java QR encoder for the cookie-handoff URL (see QrCodeGenerator);
     // 3.4.1 predates zxing's newer releases' Android API 24+ requirement,
     // so it stays compatible with this project's minSdk 21.
     implementation("com.google.zxing:core:3.4.1")
-    // Renders the startup loading.json animation (see PlayerActivity's
-    // splash overlay); 6.7.1 still supports minSdk 21.
+    // Renders the startup spinner (see PlayerActivity's splash overlay);
+    // 6.7.1 still supports minSdk 21.
     implementation("com.airbnb.android:lottie:6.7.1")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
 

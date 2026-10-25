@@ -50,11 +50,25 @@ final class SimpleImageLoader {
         return url != null && !url.isEmpty() && SHARP_CACHE.get(url) != null;
     }
 
-    /** Returns {@code true} when a cached bitmap was applied synchronously. */
+    /**
+     * Returns {@code true} when a cached bitmap was applied synchronously.
+     * <p>
+     * Falls back to the disk cache, and does so synchronously: this runs while
+     * the user is staring at a black screen waiting for the first frame, and a
+     * cover is a few tens of KB. Letting it resolve on the background executor
+     * instead would mean the snapshot path could not populate the first screen
+     * before the video decoder starts - which is the case this exists for.
+     */
     static boolean applyCachedCover(String url, ImageView sharpTarget, ImageView backdropTarget) {
         if (url == null || url.isEmpty()) return false;
         Bitmap sharp = SHARP_CACHE.get(url);
-        if (sharp == null) return false;
+        if (sharp == null) {
+            byte[] onDisk = CoverDiskCache.read(url);
+            if (onDisk == null) return false;
+            sharp = BitmapFactory.decodeByteArray(onDisk, 0, onDisk.length);
+            if (sharp == null) return false;
+            cacheCover(url, sharp);
+        }
         sharpTarget.setTag(url);
         sharpTarget.setImageBitmap(sharp);
         backdropTarget.setTag(url);
@@ -142,7 +156,19 @@ final class SimpleImageLoader {
     private static Bitmap fetchAndCache(String url) {
         Bitmap bitmap = SHARP_CACHE.get(url);
         if (bitmap != null) return bitmap;
-        return cacheCover(url, fetch(url));
+        // Disk before network: covers are signed and short-lived, so on a cold
+        // start the URL is usually already stale, but the bytes are the same
+        // image and were saved on a key that does not include the signature.
+        byte[] onDisk = CoverDiskCache.read(url);
+        if (onDisk != null) {
+            Bitmap fromDisk = BitmapFactory.decodeByteArray(onDisk, 0, onDisk.length);
+            if (fromDisk != null) return cacheCover(url, fromDisk);
+        }
+        Bitmap fetched = fetch(url);
+        if (fetched != null) {
+            CoverDiskCache.write(url, fetched);
+        }
+        return cacheCover(url, fetched);
     }
 
     private static Bitmap cacheCover(String url, Bitmap sharp) {

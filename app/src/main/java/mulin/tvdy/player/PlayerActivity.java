@@ -6,6 +6,9 @@ import android.content.pm.ActivityInfo;
 import android.graphics.Color;
 import android.graphics.Bitmap;
 import android.graphics.Outline;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -28,18 +31,22 @@ import android.widget.Toast;
 import com.airbnb.lottie.LottieAnimationView;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.annotation.OptIn;
 import androidx.media3.common.AudioAttributes;
 import androidx.media3.common.C;
+import androidx.media3.common.Format;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
+import androidx.media3.exoplayer.DecoderReuseEvaluation;
 import androidx.media3.exoplayer.DefaultLoadControl;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.ExoPlayer.PreloadConfiguration;
 import androidx.media3.exoplayer.RenderersFactory;
+import androidx.media3.exoplayer.analytics.AnalyticsListener;
 import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider;
@@ -61,6 +68,7 @@ import java.util.regex.Pattern;
 import mulin.tvdy.DeviceUtils;
 import mulin.tvdy.DouyinConstants;
 import mulin.tvdy.R;
+import mulin.tvdy.StartupTrace;
 import mulin.tvdy.auth.CookieHandoffServer;
 import mulin.tvdy.auth.CookieImportHelper;
 import mulin.tvdy.auth.LoginStatusChecker;
@@ -70,6 +78,7 @@ import androidx.recyclerview.widget.RecyclerView;
 
 import mulin.tvdy.data.CreatorVideoRepository;
 import mulin.tvdy.data.FeedRepository;
+import mulin.tvdy.data.FeedSnapshotStore;
 import mulin.tvdy.data.FeedVideo;
 import mulin.tvdy.data.WatchedAwemeStore;
 import mulin.tvdy.pump.FeedPumpController;
@@ -103,23 +112,37 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     }
 
     private static final String TAG = "PlayerActivity";
+
+    /** Separate tag so a codec trace can be grepped without the rest of logcat. */
+    private static final String CODEC_TAG = "PlayerCodec";
     /** Upcoming items to buffer; kept small so preload does not starve the active stream. */
     private static final int PRELOAD_AHEAD = 2;
-    /** Buffer target for the next playlist item while playing (µs). */
-    private static final long PRELOAD_FULL_US = 90_000_000L;
+    /**
+     * Buffer target for the next playlist item while playing (µs).
+     * <p>
+     * Deliberately a few seconds, not the 90s this used to be. The old value
+     * meant up to {@code PRELOAD_AHEAD} × 90s of neighbour video downloading
+     * alongside the current item's own {@link #MAX_BUFFER_MS} on a TV box whose
+     * link is also carrying the WebView's SPA boot. The current video's track
+     * lost that race, so the picture froze while the (much smaller) audio track
+     * stayed ahead - the reported "video stutters, sound is fine". A short
+     * head-start is still enough to make a transition seamless; it just no
+     * longer needs to beat the stream the user is actually watching.
+     */
+    private static final long PRELOAD_FULL_US = 8_000_000L;
     /** While rebuffering, stop ahead-preload so bandwidth goes to the current item. */
     private static final long PRELOAD_REBUFFER_US = 0L;
     /** Min media duration ExoPlayer tries to keep buffered while playing. */
-    private static final int MIN_BUFFER_MS = 30_000;
+    private static final int MIN_BUFFER_MS = 15_000;
     /** Max media duration ExoPlayer will buffer ahead of the playhead. */
-    private static final int MAX_BUFFER_MS = 120_000;
+    private static final int MAX_BUFFER_MS = 30_000;
     /** Min buffered media required before initial start / user seek resume. */
-    private static final int BUFFER_FOR_PLAYBACK_MS = 5_000;
+    private static final int BUFFER_FOR_PLAYBACK_MS = 2_000;
     /**
      * Min buffered media required to resume after a network stall. Larger values
      * avoid the "buffer a little → play → stall again" loop on slow links.
      */
-    private static final int BUFFER_AFTER_REBUFFER_MS = 10_000;
+    private static final int BUFFER_AFTER_REBUFFER_MS = 6_000;
     private static final int HISTORY_KEEP = 3;
     private static final long SEEK_STEP_MS = 5_000;
     /** Delay before repeated seeks begin while a direction key is held. */
@@ -139,6 +162,14 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private static final long CENTER_LONG_PRESS_MS = 500;
     private static final long PROGRESS_UPDATE_INTERVAL_MS = 500;
     /** If no video after this long, auto-retry (TV needs much longer than emulator). */
+    /** Intent extra that turns the pump into a no-injection control run. */
+    private static final String EXTRA_SKIP_HOOKS = "tvdy_skip_hooks";
+    /** Diagnostic override for the 精选 fallback window; negative disables it. */
+    private static final String EXTRA_JINGXUAN_FALLBACK_MS = "tvdy_jingxuan_fallback_ms";
+    /** Diagnostic: sample page state every 2s regardless of pump progress. */
+    private static final String EXTRA_PERIODIC_PROBE = "tvdy_periodic_probe";
+    /** Diagnostic: bypass the media byte cache to A/B a colour problem. */
+    private static final String EXTRA_NO_MEDIA_CACHE = "tvdy_no_media_cache";
     private static final long STARTUP_TIMEOUT_PHONE_MS = 45_000;
     private static final long STARTUP_TIMEOUT_TV_MS = 120_000;
     private static final int MAX_STARTUP_RETRIES = 3;
@@ -193,6 +224,14 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private boolean splashVisible = true;
     private boolean startupTimedOut = false;
     private int startupRetryCount = 0;
+    /**
+     * Videos in the initial playlist that came off the disk snapshot rather
+     * than the pump. Their signed CDN links may already be stale, in which case
+     * every candidate 403s and {@link #onPlayerError} would otherwise walk the
+     * whole queue skipping failures - a user-visible stutter of black frames
+     * before the pump's fresh data arrives. See {@link #onPlayerError}.
+     */
+    private int snapshotSourcedItems = 0;
     private long startupTimeoutMs;
     private boolean pendingStartupLoginCheck = false;
     private FrameLayout slideHost;
@@ -311,10 +350,12 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     @OptIn(markerClass = UnstableApi.class)
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        StartupTrace.mark("PlayerActivity.onCreate enter");
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         enableImmersiveMode();
         setContentView(R.layout.activity_player);
+        StartupTrace.mark("onCreate: setContentView done");
 
         splashOverlay = findViewById(R.id.splashOverlay);
         splashAnimation = findViewById(R.id.splashAnimation);
@@ -329,6 +370,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         coverImage = pageA.coverImage;
         backdropImage = pageA.backdropImage;
         initSlidePages();
+        StartupTrace.mark("onCreate: slide pages ready");
         loadingSpinner = findViewById(R.id.loadingSpinner);
         pauseIcon = findViewById(R.id.pauseIcon);
         topPanel = findViewById(R.id.topPanel);
@@ -363,8 +405,11 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         rebuildMenuItems();
 
         setupCreatorGrid();
+        StartupTrace.mark("onCreate: creator grid ready");
 
         WatchedAwemeStore.getInstance().init(this);
+        StartupTrace.mark("onCreate: watched store ready");
+        primeRepositoryFromSnapshot();
 
         // Only re-verify a saved session on startup; anonymous use is the
         // default and never prompts the user to log in.
@@ -380,6 +425,28 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         // Start the feed pump before ExoPlayer setup so douyin.com begins
         // loading while the player stack is still being constructed (matters
         // on CPU-starved TV boxes where both compete for the same cores).
+        // Diagnostic A/B for the pump-slowness investigation: `am start --ez
+        // tvdy_skip_hooks true` runs the pump page with no injected JavaScript
+        // at all, so its boot can be compared against the normal run. Note the
+        // `--ez`: plain `-e` passes a String and getBooleanExtra then parses
+        // only "true", so `-e tvdy_skip_hooks 1` silently reads as false.
+        FeedPumpController.skipHookInjection =
+                getIntent().getBooleanExtra(EXTRA_SKIP_HOOKS, false);
+        FeedPumpController.jingxuanFallbackMsOverride =
+                getIntent().getIntExtra(EXTRA_JINGXUAN_FALLBACK_MS, 0);
+        FeedPumpController.periodicProbe =
+                getIntent().getBooleanExtra(EXTRA_PERIODIC_PROBE, false);
+        if (FeedPumpController.skipHookInjection) {
+            StartupTrace.mark("DIAG: hook injection DISABLED");
+        }
+
+        // Must run before the player (and therefore the data source factory) is
+        // built, since the factory reads this when it creates each source.
+        MediaCacheStore.setDisabled(getIntent().getBooleanExtra(EXTRA_NO_MEDIA_CACHE, false));
+        if (MediaCacheStore.isDisabled()) {
+            StartupTrace.mark("DIAG: media cache DISABLED");
+        }
+
         pump = new FeedPumpController(this);
         pump.setListener(new FeedPumpController.Listener() {
             @Override
@@ -405,7 +472,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         pump.start((ViewGroup) findViewById(R.id.playerRoot));
 
         // Session cookies are injected per-request in DouyinHttpDataSource.
-        httpDataSourceFactory = new DouyinHttpDataSource.Factory();
+        httpDataSourceFactory = new DouyinHttpDataSource.Factory(this);
         progressiveSourceFactory = new ProgressiveMediaSource.Factory(httpDataSourceFactory);
 
         player = new ExoPlayer.Builder(this, buildRenderersFactory())
@@ -442,6 +509,15 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                     refillPlaylist();
                 }
                 if (playbackState == Player.STATE_BUFFERING && player.getPlayWhenReady()) {
+                    // Mid-playback rebuffer: the video track ran dry while the
+                    // audio track kept going (they are separate sources), which
+                    // the user sees as "picture freezes, sound keeps playing".
+                    // Logged with the buffered span so the cause is visible -
+                    // a starving stream shows a buffer that never climbs.
+                    Log.i(CODEC_TAG, "REBUFFER at " + player.getCurrentPosition()
+                            + "ms buffered=" + (player.getBufferedPosition()
+                            - player.getCurrentPosition()) + "ms"
+                            + " awemeId=" + (current != null ? current.awemeId : "?"));
                     player.setPreloadConfiguration(new PreloadConfiguration(PRELOAD_REBUFFER_US));
                 } else if (playbackState == Player.STATE_READY && player.isPlaying()) {
                     adjustPreloadForPlay();
@@ -488,6 +564,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
             @Override
             public void onRenderedFirstFrame() {
+                StartupTrace.mark("player: FIRST FRAME rendered");
                 if (slideAnimating) {
                     pendingCoverDismiss = true;
                     return;
@@ -504,14 +581,94 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                         + " url=" + playbackUrlFor(current)
                         + " errorCode=" + error.errorCode, error);
                 if (retryCurrentWithNextCandidate()) return;
+                // A snapshot item whose candidates are all exhausted is not
+                // worth advancing past: the whole snapshot shares one capture
+                // time, so its siblings' links are stale too. Dropping the
+                // queue and waiting for the pump beats flicking through
+                // twenty black frames first.
+                if (splashVisible && snapshotSourcedItems > 0) {
+                    abandonSnapshotAndWaitForPump();
+                    return;
+                }
                 playNext();
             }
         });
+
+        // Codec-level tracing for the "some videos render solid green after
+        // the app has been open a while" report. A green frame is what a
+        // decoder writes when its output surface or its chroma planes are not
+        // usable, so the question that settles it is *which* decoder produced
+        // it: the same hardware decoder that renders every healthy video (a
+        // surface/reuse problem), a hardware HEVC decoder (a bad HEVC stream or
+        // a broken box decoder), or a software decoder Media3 fell back to
+        // because hardware codec instances were exhausted (a resource
+        // problem). Those need three different fixes and the player logs none
+        // of it by default.
+        player.addAnalyticsListener(new AnalyticsListener() {
+            @Override
+            public void onVideoInputFormatChanged(EventTime eventTime, Format format,
+                                                  @Nullable DecoderReuseEvaluation reuse) {
+                Log.i(CODEC_TAG, "input format mime=" + format.sampleMimeType
+                        + " " + format.width + "x" + format.height
+                        + " bitrate=" + format.bitrate
+                        + " reuseResult=" + (reuse != null ? reuse.result : -1)
+                        + " awemeId=" + (current != null ? current.awemeId : "?"));
+            }
+
+            @Override
+            public void onVideoDecoderInitialized(EventTime eventTime, String decoderName,
+                                                  long initializedTimestampMs,
+                                                  long initializationDurationMs) {
+                Log.i(CODEC_TAG, "decoder=" + decoderName
+                        + " kind=" + decoderKind(decoderName)
+                        + " initMs=" + initializationDurationMs
+                        + " awemeId=" + (current != null ? current.awemeId : "?"));
+            }
+
+            @Override
+            public void onVideoDecoderReleased(EventTime eventTime, String decoderName) {
+                Log.i(CODEC_TAG, "decoder released=" + decoderName);
+            }
+
+            @Override
+            public void onDroppedVideoFrames(EventTime eventTime, int droppedFrames,
+                                             long elapsedMs) {
+                Log.w(CODEC_TAG, "dropped frames=" + droppedFrames + " in " + elapsedMs + "ms");
+            }
+        });
+
         playerView.setPlayer(player);
 
         repository.addListener(this);
         creatorRepository.addListener(this::onCreatorVideosChanged);
         startInitialPlayback();
+        StartupTrace.mark("PlayerActivity.onCreate exit");
+    }
+
+    /**
+     * Classifies a MediaCodec name as hardware or software. Media3 picks from
+     * {@link android.media.MediaCodecList} in order, so a fallback after a
+     * hardware decoder fails shows up here as a sudden switch to a
+     * {@code *.sw.*} / {@code c2.android.*} / {@code OMX.google.*} name.
+     */
+    private static String decoderKind(String decoderName) {
+        if (decoderName == null) return "unknown";
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                for (MediaCodecInfo info : new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos()) {
+                    if (decoderName.equals(info.getName())) {
+                        return info.isHardwareAccelerated() ? "hardware" : "software";
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        String lower = decoderName.toLowerCase(Locale.US);
+        if (lower.startsWith("c2.android.") || lower.startsWith("omx.google.")
+                || lower.contains(".sw.")) {
+            return "software";
+        }
+        return "hardware?";
     }
 
     /** Keeps the live player on page A; page B is cover-only staging off-screen. */
@@ -591,6 +748,10 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         if (!splashVisible) return;
         splashVisible = false;
         cancelStartupTimeout();
+        // Note in the timeline: this is where the third WebView (login check)
+        // and the watch-history sync land, i.e. right on top of the first
+        // video's initial buffering.
+        StartupTrace.mark("startup login check + history sync kick off");
         maybeRunDeferredLoginCheck();
         splashOverlay.animate()
                 .alpha(0f)
@@ -600,6 +761,100 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                     splashAnimation.cancelAnimation();
                 })
                 .start();
+    }
+
+    /**
+     * Loads the last saved feed snapshot so {@link #startInitialPlayback} has
+     * something to play without waiting for the pump's WebView.
+     * <p>
+     * This is the whole point of the snapshot: the SPA boot plus the page's own
+     * feed XHR cost ~31s end to end on the TV, while reading a few tens of KB
+     * off internal storage costs single-digit milliseconds. The pump still runs
+     * and will replace these items as soon as its own capture lands, so a
+     * snapshot whose signed CDN links have expired degrades to the previous
+     * behaviour (candidate retry, then fresh data) rather than breaking.
+     */
+    private void primeRepositoryFromSnapshot() {
+        try {
+            java.util.List<mulin.tvdy.data.FeedVideo> videos = FeedSnapshotStore.read(this);
+            if (videos == null || videos.isEmpty()) return;
+            int before = repository.bufferSize();
+            // Blocking: the whole point of the snapshot is to have the first
+            // item ready before ExoPlayer is built, and a cross-thread round
+            // trip here would only add latency to the path we are trying to
+            // shorten. The videos arrive already distilled, so this is a few
+            // tens of milliseconds - see FeedSnapshotStore.
+            repository.addVideosBlocking(videos);
+            int accepted = Math.max(0, repository.bufferSize() - before);
+            snapshotSourcedItems = accepted;
+            StartupTrace.mark("startup: repository primed from snapshot n=" + videos.size()
+                    + " accepted=" + accepted
+                    + " buffer=" + repository.bufferSize());
+            if (before > 0) {
+                // Warm restart: the process outlived the last Activity, so the
+                // repository singleton still holds playable videos. The snapshot
+                // adding nothing here means its items are duplicates of what is
+                // already queued, not that the fast path failed - so the queue
+                // must be kept. These items are of the same vintage as the
+                // snapshot (the last session's capture), so they carry the same
+                // stale-link risk: mark them snapshot-sourced so a dead link
+                // still degrades to the pump instead of flicking through the
+                // rest of the queue as black frames.
+                snapshotSourcedItems = repository.bufferSize();
+                StartupTrace.mark("startup: reusing warm buffer n=" + before);
+                return;
+            }
+            // Cold start with everything in the snapshot already watched on this
+            // account, so there is nothing to show for the fast path. Forget the
+            // snapshot so the pump's fresh capture is not treated as duplicate,
+            // and let the normal splash-and-wait flow take over.
+            if (accepted == 0) {
+                StartupTrace.mark("startup: snapshot fully filtered, using pump");
+                repository.reset();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "snapshot priming failed", e);
+        }
+    }
+
+    /**
+     * Gives up on the loaded snapshot and hands the cold start back to the
+     * pump: the snapshot's signed links are stale, so nothing in it can play.
+     * <p>
+     * {@code repository.reset()} is required rather than optional - priming
+     * pushed the snapshot's aweme ids into the repository's dedup set, so the
+     * pump's fresh capture of the <em>same</em> videos would otherwise be
+     * dropped as duplicates and the app would sit on an empty queue forever.
+     */
+    private void abandonSnapshotAndWaitForPump() {
+        Log.w(TAG, "snapshot links unusable, falling back to the pump; dropped="
+                + snapshotSourcedItems);
+        StartupTrace.mark("startup: snapshot abandoned after player error");
+        snapshotSourcedItems = 0;
+        repository.reset();
+        playlist.clear();
+        playlistIndex = -1;
+        current = null;
+        resumePositions.clear();
+        pendingAdvance = 0;
+        waitingForBuffer = true;
+        autoStartWhenReady = true;
+        if (player != null) {
+            player.stop();
+            player.clearMediaItems();
+        }
+        updateSplashStatus("正在加载视频…");
+        // Re-arm the timeout: the splash has been up since onCreate and the
+        // pump now has to fetch from scratch.
+        scheduleStartupTimeout();
+        if (pump != null) {
+            // reloadFeed() re-runs the page pipeline in place, reusing the warm
+            // renderer and its cached bytecode. hardRestart() throws the
+            // WebView away and would pay the ~12.6s SPA boot again for no gain
+            // here, since the failure is a stale signature rather than a
+            // wedged page.
+            pump.reloadFeed();
+        }
     }
 
     private void startInitialPlayback() {
@@ -618,6 +873,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 + " cookieLen=" + DouyinConstants.playbackCookieLength()
                 + " candidates=" + current.playUrlCandidates.size()
                 + " url=" + playbackUrlFor(current));
+        StartupTrace.mark("player: prepare() first item");
         player.prepare();
         player.setPlayWhenReady(true);
         player.play();
@@ -751,6 +1007,9 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
      */
     private void resetPlaybackAndFeed() {
         repository.reset();
+        // Whatever arrives from here on comes from the pump, not the disk
+        // snapshot, so the stale-link guard must not fire on it.
+        snapshotSourcedItems = 0;
         playlist.clear();
         playlistIndex = -1;
         current = null;
@@ -1497,11 +1756,26 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         if (video == null) return "";
         FeedVideo.SplitPlayUrl split = selectedSplit(video);
         if (split != null) return split.videoUrl;
-        int idx = playUrlCandidateIndex.getOrDefault(video.awemeId, 0);
-        if (idx >= 0 && idx < video.playUrlCandidates.size()) {
-            return video.playUrlCandidates.get(idx);
+        int idx = Math.max(playUrlCandidateIndex.getOrDefault(video.awemeId, 0), 0);
+        boolean hevcOk = HevcCapability.isSupported();
+        // selectedSplit() refuses HEVC when the probe says no HEVC, but this
+        // list is plain URLs with the flag already thrown away, so the gate was
+        // silently missing here: collectPlayUrls() keeps HEVC entries (sorted
+        // last, not dropped) and this returned whichever sat at the index.
+        for (int i = idx; i < video.playUrlCandidates.size(); i++) {
+            String candidate = video.playUrlCandidates.get(i);
+            if (!hevcOk && looksHevc(candidate)) continue;
+            if (i != idx) playUrlCandidateIndex.put(video.awemeId, i);
+            return candidate;
         }
         return video.playUrl != null ? video.playUrl : "";
+    }
+
+    /** Same URL-level sniff {@link FeedVideo} uses when building its candidates. */
+    private static boolean looksHevc(String url) {
+        if (url == null) return false;
+        String lower = url.toLowerCase(Locale.US);
+        return lower.contains("hvc1") || lower.contains("bytevc1") || lower.contains("hevc");
     }
 
     private static String playbackModeLabel(FeedVideo video) {
@@ -1536,6 +1810,13 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         }
 
         int nextIdx = playUrlCandidateIndex.getOrDefault(current.awemeId, 0) + 1;
+        // Same missing HEVC gate as playbackUrlFor() - step over HEVC mirrors
+        // when the device said it cannot decode them.
+        boolean hevcOk = HevcCapability.isSupported();
+        while (nextIdx < current.playUrlCandidates.size()
+                && !hevcOk && looksHevc(current.playUrlCandidates.get(nextIdx))) {
+            nextIdx++;
+        }
         if (nextIdx >= current.playUrlCandidates.size()) return false;
         playUrlCandidateIndex.put(current.awemeId, nextIdx);
         String altUrl = current.playUrlCandidates.get(nextIdx);
